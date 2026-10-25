@@ -96,6 +96,16 @@ struct X11Manager {
     return func(Ptr);
   }
 
+  static int HostXSync(Display* Dis, Bool Discard) {
+    static auto func = reinterpret_cast<decltype(&XSync)>(dlsym(GetLibX11(), "XSync"));
+    return func(Dis, Discard);
+  }
+
+  static XErrorHandler HostXSetErrorHandler(XErrorHandler Handler) {
+    static auto func = reinterpret_cast<decltype(&XSetErrorHandler)>(dlsym(GetLibX11(), "XSetErrorHandler"));
+    return func(Handler);
+  }
+
   static int HostXFlush(Display* Dis) {
     static auto func = reinterpret_cast<decltype(&XFlush)>(dlsym(GetLibX11(), "XFlush"));
     return func(Dis);

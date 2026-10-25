@@ -79,11 +79,35 @@ static void* malloc_wrapper(size_t size) {
   return malloc(size);
 }
 
+// Deliver host GLX protocol errors through the guest Xlib error dispatcher.
+// _XError invokes the handler registered by the application via XSetErrorHandler.
+// The host and guest use separate X connections; their request serials are not
+// interchangeable. The originating host serial is provided for diagnostics.
+static int GuestDeliverXError(uintptr_t GuestDisplay, uint64_t Serial, uint64_t ResourceId,
+                              uint32_t ErrorCode, uint32_t RequestCode, uint32_t MinorCode) {
+  using XErrorDispatcher = int (*)(Display*, XErrorEvent*);
+  static auto Dispatch = reinterpret_cast<XErrorDispatcher>(dlsym(RTLD_DEFAULT, "_XError"));
+  if (!Dispatch) {
+    fprintf(stderr, "FEX libGL: guest libX11 _XError is unavailable; cannot deliver GLX error\n");
+    std::abort();
+  }
+  XErrorEvent Error {};
+  Error.type = 0;
+  Error.display = reinterpret_cast<Display*>(GuestDisplay);
+  Error.serial = static_cast<unsigned long>(Serial);
+  Error.resourceid = static_cast<XID>(ResourceId);
+  Error.error_code = static_cast<unsigned char>(ErrorCode);
+  Error.request_code = static_cast<unsigned char>(RequestCode);
+  Error.minor_code = static_cast<unsigned char>(MinorCode);
+  return Dispatch(Error.display, &Error);
+}
+
 static void OnInit() {
   fexfn_pack_GL_SetGuestMalloc((uintptr_t)malloc_wrapper, (uintptr_t)CallbackUnpack<decltype(malloc_wrapper)>::Unpack);
   fexfn_pack_GL_SetGuestXSync((uintptr_t)XSync, (uintptr_t)CallbackUnpack<decltype(XSync)>::Unpack);
   fexfn_pack_GL_SetGuestXGetVisualInfo((uintptr_t)XGetVisualInfo, (uintptr_t)CallbackUnpack<decltype(XGetVisualInfo)>::Unpack);
   fexfn_pack_GL_SetGuestXDisplayString((uintptr_t)XDisplayString, (uintptr_t)CallbackUnpack<decltype(XDisplayString)>::Unpack);
+  fexfn_pack_GL_SetGuestXError((uintptr_t)GuestDeliverXError, (uintptr_t)CallbackUnpack<decltype(GuestDeliverXError)>::Unpack);
 }
 
 // libGL.so must pull in libX11.so as a dependency. Referencing some libX11

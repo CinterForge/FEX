@@ -37,6 +37,37 @@ static X11Manager x11_manager;
 
 static void* (*GuestMalloc)(guest_size_t) = nullptr;
 
+// Host libGL uses a separate X11 connection. Without an error handler,
+// an asynchronous GLX protocol error invokes host Xlib's process-exiting
+// default handler instead of the application's guest XSetErrorHandler.
+using GuestXErrorCallback = int (*)(uintptr_t, uint64_t, uint64_t, uint32_t, uint32_t, uint32_t);
+static GuestXErrorCallback GuestXError = nullptr;
+static XErrorHandler PreviousHostXErrorHandler = nullptr;
+
+static int HostGLXErrorHandler(Display* HostDisplay, XErrorEvent* Error) {
+  if (GuestXError) {
+    // HostToGuestDisplay only succeeds for GL thunk-managed connections.
+    // Do not swallow errors from unrelated native Xlib users.
+    std::unique_lock lock(x11_manager.mutex);
+    for (const auto& [GuestDisplay, KnownHostDisplay] : x11_manager.displays) {
+      if (KnownHostDisplay == HostDisplay) {
+        const auto GuestAddress = reinterpret_cast<uintptr_t>(GuestDisplay);
+        lock.unlock();
+        return GuestXError(GuestAddress, Error->serial, Error->resourceid,
+                           Error->error_code, Error->request_code, Error->minor_code);
+      }
+    }
+  }
+  if (PreviousHostXErrorHandler && PreviousHostXErrorHandler != HostGLXErrorHandler) {
+    return PreviousHostXErrorHandler(HostDisplay, Error);
+  }
+  fprintf(stderr, "FEX libGL: unhandled host X11 error %u on display %p\n",
+          Error->error_code, HostDisplay);
+  std::abort();
+}
+
+
+
 host_layout<_XDisplay*>::host_layout(guest_layout<_XDisplay*>& guest)
   : guest_display(guest.force_get_host_pointer()) {
   data = x11_manager.GuestToHostDisplay(guest_display);
@@ -49,6 +80,11 @@ host_layout<_XDisplay*>::~host_layout() {
 
 // Functions returning _XDisplay* should be handled explicitly via ptr_passthrough
 guest_layout<_XDisplay*> to_guest(host_layout<_XDisplay*>) = delete;
+
+static void fexfn_impl_libGL_GL_SetGuestXError(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
+  MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &GuestXError);
+  PreviousHostXErrorHandler = x11_manager.HostXSetErrorHandler(HostGLXErrorHandler);
+}
 
 static void fexfn_impl_libGL_GL_SetGuestMalloc(uintptr_t GuestTarget, uintptr_t GuestUnpacker) {
   MakeHostTrampolineForGuestFunctionAt(GuestTarget, GuestUnpacker, &GuestMalloc);
@@ -388,6 +424,17 @@ guest_layout<XVisualInfo*> fexfn_impl_libGL_glXGetVisualFromFBConfigSGIX(Display
 
 guest_layout<XVisualInfo*> fexfn_impl_libGL_glXChooseVisual(Display* Display, int Screen, int* Attributes) {
   return MapToGuestVisualInfo(Display, fexldr_ptr_libGL_glXChooseVisual(Display, Screen, Attributes));
+}
+
+// Context creation reports some failures as asynchronous X errors. Drain
+// them before returning to guest code, so the guest handler receives the
+// failure while the originating GLX thunk is still active.
+GLXContext fexfn_impl_libGL_glXCreateContextAttribsARB(Display* Display, GLXFBConfig Config,
+                                                       GLXContext ShareContext, Bool Direct,
+                                                       const int* AttribList) {
+  auto Result = fexldr_ptr_libGL_glXCreateContextAttribsARB(Display, Config, ShareContext, Direct, AttribList);
+  x11_manager.HostXSync(Display, False);
+  return Result;
 }
 
 GLXContext fexfn_impl_libGL_glXCreateContext(Display* Display, guest_layout<XVisualInfo*> Info, GLXContext ShareList, Bool Direct) {

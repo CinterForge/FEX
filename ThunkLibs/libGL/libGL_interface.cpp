@@ -26,6 +26,7 @@ void GL_SetGuestMalloc(uintptr_t, uintptr_t);
 void GL_SetGuestXSync(uintptr_t, uintptr_t);
 void GL_SetGuestXGetVisualInfo(uintptr_t, uintptr_t);
 void GL_SetGuestXDisplayString(uintptr_t, uintptr_t);
+void GL_SetGuestXError(uintptr_t, uintptr_t);
 template<>
 struct fex_gen_config<GL_SetGuestMalloc> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 template<>
@@ -34,6 +35,8 @@ template<>
 struct fex_gen_config<GL_SetGuestXGetVisualInfo> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<GL_SetGuestXDisplayString> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
+template<>
+struct fex_gen_config<GL_SetGuestXError> : fexgen::custom_guest_entrypoint, fexgen::custom_host_impl {};
 
 template<typename>
 struct fex_gen_type {};
@@ -266,7 +269,7 @@ struct fex_gen_param<glXGetVisualFromFBConfig, -1, XVisualInfo*> : fexgen::ptr_p
 
 // template<> struct fex_gen_config<glXCreateContextAttribs> {};
 template<>
-struct fex_gen_config<glXCreateContextAttribsARB> {};
+struct fex_gen_config<glXCreateContextAttribsARB> : fexgen::custom_host_impl {};
 template<>
 struct fex_gen_config<glXSwapIntervalEXT> {};
 
