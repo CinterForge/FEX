@@ -8,6 +8,7 @@ $end_info$
 #include <cstdio>
 #include <cstdlib>
 #include <string_view>
+#include <vector>
 
 #define GL_GLEXT_PROTOTYPES 1
 #define GLX_GLXEXT_PROTOTYPES 1
@@ -44,6 +45,21 @@ using GuestXErrorCallback = int (*)(uintptr_t, uint64_t, uint64_t, uint32_t, uin
 static GuestXErrorCallback GuestXError = nullptr;
 static XErrorHandler PreviousHostXErrorHandler = nullptr;
 
+// Host Xlib invokes its error handler while processing an XSync reply.
+// Calling back into the emulated guest from that handler re-enters Xlib
+// while the host connection is still active and can deadlock. Collect
+// errors for the context-creation thunk, then deliver them after XSync
+// has completely returned (and released its internal display lock).
+struct PendingGLXError {
+  uintptr_t GuestDisplay;
+  uint64_t Serial;
+  uint64_t ResourceId;
+  uint32_t ErrorCode;
+  uint32_t RequestCode;
+  uint32_t MinorCode;
+};
+static thread_local std::vector<PendingGLXError>* ActiveGLXErrors = nullptr;
+
 static int HostGLXErrorHandler(Display* HostDisplay, XErrorEvent* Error) {
   if (GuestXError) {
     // HostToGuestDisplay only succeeds for GL thunk-managed connections.
@@ -53,6 +69,11 @@ static int HostGLXErrorHandler(Display* HostDisplay, XErrorEvent* Error) {
       if (KnownHostDisplay == HostDisplay) {
         const auto GuestAddress = reinterpret_cast<uintptr_t>(GuestDisplay);
         lock.unlock();
+        if (ActiveGLXErrors) {
+          ActiveGLXErrors->push_back({GuestAddress, Error->serial, Error->resourceid,
+                                      Error->error_code, Error->request_code, Error->minor_code});
+          return 0;
+        }
         return GuestXError(GuestAddress, Error->serial, Error->resourceid,
                            Error->error_code, Error->request_code, Error->minor_code);
       }
@@ -432,8 +453,21 @@ guest_layout<XVisualInfo*> fexfn_impl_libGL_glXChooseVisual(Display* Display, in
 GLXContext fexfn_impl_libGL_glXCreateContextAttribsARB(Display* Display, GLXFBConfig Config,
                                                        GLXContext ShareContext, Bool Direct,
                                                        const int* AttribList) {
+  std::vector<PendingGLXError> Errors;
+  // Only capture errors during this thunk's host GLX request and sync.
+  // A nested call must not invalidate its caller's pending-error queue.
+  auto* PreviousErrors = ActiveGLXErrors;
+  ActiveGLXErrors = &Errors;
   auto Result = fexldr_ptr_libGL_glXCreateContextAttribsARB(Display, Config, ShareContext, Direct, AttribList);
   x11_manager.HostXSync(Display, False);
+  ActiveGLXErrors = PreviousErrors;
+
+  // No host Xlib operation or host-display mutex is active here.
+  // Guest applications can safely handle GLX errors through guest Xlib.
+  for (const auto& Error : Errors) {
+    GuestXError(Error.GuestDisplay, Error.Serial, Error.ResourceId,
+                Error.ErrorCode, Error.RequestCode, Error.MinorCode);
+  }
   return Result;
 }
 
