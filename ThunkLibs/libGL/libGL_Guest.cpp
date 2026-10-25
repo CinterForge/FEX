@@ -10,6 +10,7 @@ $end_info$
 
 #include <GL/glx.h>
 #include <GL/glxext.h>
+#include <X11/Xproto.h>
 #include <GL/gl.h>
 #include <GL/glext.h>
 
@@ -79,36 +80,34 @@ static void* malloc_wrapper(size_t size) {
   return malloc(size);
 }
 
-// Deliver host GLX protocol errors through the guest Xlib error dispatcher.
-// _XError invokes the handler registered by the application via XSetErrorHandler.
-// The host and guest use separate X connections; their request serials are not
-// interchangeable. The originating host serial is provided for diagnostics.
-static int GuestDeliverXError(uintptr_t GuestDisplay, uint64_t Serial, uint64_t ResourceId,
+// _XError consumes the on-wire X11 xError packet, NOT XErrorEvent.
+// XErrorEvent is an application-facing structure with a different layout:
+// treating it as xError corrupts the packet's 16-bit sequence number and
+// produces "Xlib: sequence lost" when libX11 decodes the fabricated packet.
+// The host and guest use separate X11 connections; never forward the host
+// sequence number to the guest Xlib transport.
+static int GuestDeliverXError(uintptr_t GuestDisplay, uint64_t HostSerial, uint64_t ResourceId,
                               uint32_t ErrorCode, uint32_t RequestCode, uint32_t MinorCode) {
-  using XErrorDispatcher = int (*)(Display*, XErrorEvent*);
+  using XErrorDispatcher = int (*)(Display*, xError*);
   static auto Dispatch = reinterpret_cast<XErrorDispatcher>(dlsym(RTLD_DEFAULT, "_XError"));
   if (!Dispatch) {
     fprintf(stderr, "FEX libGL: guest libX11 _XError is unavailable; cannot deliver GLX error\n");
     std::abort();
   }
-  XErrorEvent Error {};
-  Error.type = 0;
-  Error.display = reinterpret_cast<Display*>(GuestDisplay);
-  // The host and guest X11 connections have independent request streams.
-  // A host request serial cannot be passed to guest libX11: _XError will
-  // interpret it against the guest display's sequence state, producing
-  // "Xlib: sequence lost" and corrupting the guest error-recovery path.
-  // GLX requests performed by the host thunk do not consume guest-side
-  // request numbers, so associate the error with the last guest request
-  // that Xlib has processed, rather than inventing a guest request number.
-  // Keep the true host serial in the thunk boundary for diagnostics.
-  (void)Serial;
-  Error.serial = LastKnownRequestProcessed(Error.display);
-  Error.resourceid = static_cast<XID>(ResourceId);
-  Error.error_code = static_cast<unsigned char>(ErrorCode);
-  Error.request_code = static_cast<unsigned char>(RequestCode);
-  Error.minor_code = static_cast<unsigned char>(MinorCode);
-  return Dispatch(Error.display, &Error);
+
+  auto* DisplayConnection = reinterpret_cast<Display*>(GuestDisplay);
+  xError WireError {};
+  WireError.type = X_Error;
+  WireError.errorCode = static_cast<CARD8>(ErrorCode);
+  // GLX requests sent through the host thunk do not occupy guest X11 serial
+  // numbers. Reuse the guest's already-processed serial so _XError cannot
+  // advance the guest's independent request/reply stream.
+  (void)HostSerial;
+  WireError.sequenceNumber = static_cast<CARD16>(LastKnownRequestProcessed(DisplayConnection));
+  WireError.resourceID = static_cast<CARD32>(ResourceId);
+  WireError.majorCode = static_cast<CARD8>(RequestCode);
+  WireError.minorCode = static_cast<CARD16>(MinorCode);
+  return Dispatch(DisplayConnection, &WireError);
 }
 
 static void OnInit() {
