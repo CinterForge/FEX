@@ -94,7 +94,16 @@ static int GuestDeliverXError(uintptr_t GuestDisplay, uint64_t Serial, uint64_t 
   XErrorEvent Error {};
   Error.type = 0;
   Error.display = reinterpret_cast<Display*>(GuestDisplay);
-  Error.serial = static_cast<unsigned long>(Serial);
+  // The host and guest X11 connections have independent request streams.
+  // A host request serial cannot be passed to guest libX11: _XError will
+  // interpret it against the guest display's sequence state, producing
+  // "Xlib: sequence lost" and corrupting the guest error-recovery path.
+  // GLX requests performed by the host thunk do not consume guest-side
+  // request numbers, so associate the error with the last guest request
+  // that Xlib has processed, rather than inventing a guest request number.
+  // Keep the true host serial in the thunk boundary for diagnostics.
+  (void)Serial;
+  Error.serial = LastKnownRequestProcessed(Error.display);
   Error.resourceid = static_cast<XID>(ResourceId);
   Error.error_code = static_cast<unsigned char>(ErrorCode);
   Error.request_code = static_cast<unsigned char>(RequestCode);
